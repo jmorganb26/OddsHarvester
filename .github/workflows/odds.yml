@@ -29,7 +29,7 @@ jobs:
       - name: Run scraper
         run: |
           mkdir -p out
-          uv run oddsharvester upcoming -s football -d 20260217 -m 1x2,double_chance,draw_no_bet,over_under,asian_handicap -f csv -o out/odds.csv --headless --bookies-filter classic --target-bookmaker "bet365.us" -c 6
+          uv run oddsharvester upcoming --help
 
       - name: Upload CSV
         uses: actions/upload-artifact@v4
