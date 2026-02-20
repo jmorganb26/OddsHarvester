@@ -1,5 +1,4 @@
-Filtro:,Over 0.5 1H,
-,,
+idx,match,league
 1,Athletic Bilbao vs Elche,España La Liga
 2,Greuther Fürth vs Arminia Bielefeld,Alemania 2. Bundesliga
 3,Frosinone vs Empoli,Italia Serie B
@@ -50,3 +49,4 @@ Filtro:,Over 0.5 1H,
 48,Adelaide United vs Perth Glory,Australia A-League
 49,Wellington Phoenix vs Auckland,Australia A-League
 50,Sydney FC vs Brisbane Roar,Australia A-League
+
