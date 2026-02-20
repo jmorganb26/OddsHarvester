@@ -32,18 +32,14 @@ jobs:
           DATE=$(date -u -d "tomorrow" +"%Y%m%d")
           echo "Scraping date (UTC): $DATE"
 
-          # ---- Settings ----
           CONCURRENCY=6
-          # Keep preview-only for speed; if you see missing odds often, switch to --full-scrape
           SCRAPE_MODE="--preview-only"
 
-          # ---- Bookmakers ----
           B1="bet365.us"
           B2="Pinnacle"
 
           echo "Bookmakers: $B1 + $B2"
 
-          # 1) Over/Under 1.5 FULL TIME (we only need the OVER price)
           uv run oddsharvester upcoming \
             -s football \
             -m over_under_1_5 \
@@ -52,6 +48,7 @@ jobs:
             --format csv \
             -o "out/ou15_ft_${B1}.csv" \
             --concurrency $CONCURRENCY \
+            --headless \
             $SCRAPE_MODE \
             -d $DATE
 
@@ -63,10 +60,10 @@ jobs:
             --format csv \
             -o "out/ou15_ft_${B2}.csv" \
             --concurrency $CONCURRENCY \
+            --headless \
             $SCRAPE_MODE \
             -d $DATE
 
-          # 2) Over/Under 0.5 FIRST HALF (we only need the OVER price)
           uv run oddsharvester upcoming \
             -s football \
             -m over_under_0_5 \
@@ -75,6 +72,7 @@ jobs:
             --format csv \
             -o "out/ou05_1h_${B1}.csv" \
             --concurrency $CONCURRENCY \
+            --headless \
             $SCRAPE_MODE \
             -d $DATE
 
@@ -86,6 +84,7 @@ jobs:
             --format csv \
             -o "out/ou05_1h_${B2}.csv" \
             --concurrency $CONCURRENCY \
+            --headless \
             $SCRAPE_MODE \
             -d $DATE
 
@@ -101,36 +100,26 @@ jobs:
           def load_csv(path):
             if not os.path.exists(path):
               raise FileNotFoundError(path)
-            df = pd.read_csv(path)
-            return df
+            return pd.read_csv(path)
 
           def extract_over_price(cell):
-            """
-            cell is usually like:
-              [{'odds_over':'1.30','odds_under':'3.50','bookmaker_name':'bet365.us','period':'FullTime'}]
-            or [].
-            We only take odds_over from the first item if present.
-            """
             if pd.isna(cell):
               return None
             s = str(cell).strip()
-            if s == "[]" or s == "" or s.lower() == "nan":
+            if s in ("[]", "", "nan", "NaN"):
               return None
             try:
               data = ast.literal_eval(s)
-              if not isinstance(data, list) or len(data) == 0:
+              if not isinstance(data, list) or not data:
                 return None
               item = data[0]
               if not isinstance(item, dict):
                 return None
               v = item.get("odds_over")
-              if v is None:
-                return None
-              return float(v)
+              return float(v) if v is not None else None
             except Exception:
               return None
 
-          # Files
           f_ou15_b1 = f"out/ou15_ft_{B1}.csv"
           f_ou15_b2 = f"out/ou15_ft_{B2}.csv"
           f_ou05_b1 = f"out/ou05_1h_{B1}.csv"
@@ -141,16 +130,12 @@ jobs:
           d05_1 = load_csv(f_ou05_b1)
           d05_2 = load_csv(f_ou05_b2)
 
-          # Columns names depend on your exporter; these are from your sample schema:
           col_ou15 = "over_under_1_5_market"
           col_ou05 = "over_under_0_5_market"
-
           key_cols = ["match_link","match_date","home_team","away_team","league_name"]
 
-          # Reduce and extract prices
           def reduce(df, col, outcol):
             base = df.copy()
-            # some rows may lack league_name; keep anyway
             for c in key_cols:
               if c not in base.columns:
                 base[c] = None
@@ -162,13 +147,10 @@ jobs:
           r05_1 = reduce(d05_1, col_ou05, "ou05_1h_over_"+B1)
           r05_2 = reduce(d05_2, col_ou05, "ou05_1h_over_"+B2)
 
-          # Merge by match_link (most stable key)
-          def m2(a,b):
-            return a.merge(b, on=key_cols, how="outer")
+          merged = r15_1.merge(r15_2, on=key_cols, how="outer")
+          merged = merged.merge(r05_1, on=key_cols, how="outer")
+          merged = merged.merge(r05_2, on=key_cols, how="outer")
 
-          merged = m2(m2(r15_1, r15_2), m2(r05_1, r05_2))
-
-          # Averages (only where at least 1 value exists)
           def avg2(x,y):
             if pd.isna(x) and pd.isna(y): return None
             if pd.isna(x): return float(y)
@@ -178,7 +160,6 @@ jobs:
           merged["ou15_over_avg"] = merged.apply(lambda r: avg2(r.get("ou15_over_"+B1), r.get("ou15_over_"+B2)), axis=1)
           merged["ou05_1h_over_avg"] = merged.apply(lambda r: avg2(r.get("ou05_1h_over_"+B1), r.get("ou05_1h_over_"+B2)), axis=1)
 
-          # Output (focus fields + keep per-book for debugging)
           out_cols = key_cols + [
             "ou15_over_"+B1, "ou15_over_"+B2, "ou15_over_avg",
             "ou05_1h_over_"+B1, "ou05_1h_over_"+B2, "ou05_1h_over_avg",
