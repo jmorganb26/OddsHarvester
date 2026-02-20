@@ -7,189 +7,255 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
+from playwright.async_api import async_playwright, Page
+
 
 ODDSPORTAL_BASE = "https://www.oddsportal.com"
-SPORT = "football"
-
-INPUT_OVER15 = Path("input/Over15.csv")
-INPUT_OVER05_1H = Path("input/Over05_1h.csv")
-
 OUT_DIR = Path("out")
 DEBUG_DIR = OUT_DIR / "debug"
+INPUT_DIR = Path("input")
 
+# Input files
+IN_OVER15 = INPUT_DIR / "Over15.csv"
+IN_OVER05_1H = INPUT_DIR / "Over05_1h.csv"
 
-def env_true(name: str) -> bool:
-    v = os.getenv(name, "").strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
-
-
-HEADLESS = env_true("OH_HEADLESS")
-DEBUG_DUMP = env_true("OH_DEBUG_DUMP")
+# Output
+OUT_MATCH_LINKS = OUT_DIR / "match_links.csv"
 
 
 @dataclass
-class Row:
-    idx: str
-    match: str
-    league: str
+class InputRow:
+    bucket: str            # over15 / over05_1h
+    idx: str               # original index from your sheet
+    match: str             # "Team A vs Team B"
+    league: str            # "México Liga MX" etc.
 
 
-def slug(s: str) -> str:
-    s = s.strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    return s.strip("-")[:80] or "item"
+def _now_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
-def read_input_csv(path: Path) -> list[Row]:
-    rows: list[Row] = []
+def read_input_csv(path: Path, bucket: str) -> list[InputRow]:
+    """
+    Reads your CSV exported from Sheets.
+    Expected rows like:
+      1,Tigres UANL vs Pachuca CF,México Liga MX
+    It may also have extra header lines like:
+      Filtro:,Over 1.5,
+      ,,
+    We skip rows that don't look like (idx, match, league).
+    """
+    rows: list[InputRow] = []
+    if not path.exists():
+        return rows
+
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
         for r in reader:
             if not r:
                 continue
-            # Tus CSV traen encabezados tipo: "Filtro:,Over 1.5," y luego ",,"
-            if len(r) >= 1 and (r[0].startswith("Filtro:") or r[0].strip() == ""):
-                continue
-            # Formato esperado: idx, match, league
+            # We expect at least 3 columns
             if len(r) < 3:
                 continue
-            idx, match, league = r[0].strip(), r[1].strip(), r[2].strip()
+
+            idx = (r[0] or "").strip()
+            match = (r[1] or "").strip()
+            league = (r[2] or "").strip()
+
+            # Skip header-ish rows
             if not idx.isdigit():
                 continue
-            if not match or " vs " not in match:
+            if " vs " not in match.lower():
                 continue
-            rows.append(Row(idx=idx, match=match, league=league))
+
+            rows.append(InputRow(bucket=bucket, idx=idx, match=match, league=league))
+
     return rows
 
 
-def normalize_team_name(s: str) -> str:
-    s = s.lower().strip()
-    s = s.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u").replace("ü", "u").replace("ñ", "n")
-    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+def normalize_text(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[\u2019\u2018\u201C\u201D]", "'", s)
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def split_match(match: str) -> tuple[str, str]:
-    home, away = match.split(" vs ", 1)
-    return normalize_team_name(home), normalize_team_name(away)
-
-
-async def dump_debug(page, tag: str):
-    if not DEBUG_DUMP:
-        return
-    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    base = DEBUG_DIR / f"{ts}_{slug(tag)}"
-    try:
-        await page.screenshot(path=str(base) + ".png", full_page=True)
-    except Exception:
-        pass
-    try:
-        html = await page.content()
-        (Path(str(base) + ".html")).write_text(html, encoding="utf-8")
-    except Exception:
-        pass
-
-
-async def find_match_link_for_row(page, row: Row) -> Optional[str]:
+async def accept_privacy_if_present(page: Page) -> None:
     """
-    Estrategia:
-    1) Buscar por el match completo (texto) en OddsPortal (search).
-    2) Abrir resultados y escoger el que mejor matchee por home/away.
+    OddsPortal often shows a privacy/cookie overlay with buttons like:
+    "I Accept", "Accept All", "Reject All".
+    This function tries multiple safe selectors.
     """
-    home, away = split_match(row.match)
+    candidates = [
+        re.compile(r"^i accept$", re.I),
+        re.compile(r"^accept all$", re.I),
+        re.compile(r"^accept$", re.I),
+        re.compile(r"^agree$", re.I),
+    ]
 
-    query = row.match
-    search_url = f"{ODDSPORTAL_BASE}/search/?q={query.replace(' ', '+')}"
-    await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-    await page.wait_for_timeout(800)
-
-    # Si OddsPortal cambia el DOM, esto igual puede fallar: por eso debug dump.
-    try:
-        items = page.locator("a").filter(has_text=" - ").all()
-    except Exception:
-        items = []
-
-    # Fallback más robusto: buscar anchors que contengan ambos equipos (normalizados)
-    anchors = await page.query_selector_all("a[href]")
-    best = None
-
-    for a in anchors:
+    # Try up to a few times because the overlay can render late
+    for _ in range(5):
         try:
+            for patt in candidates:
+                btn = page.get_by_role("button", name=patt)
+                if await btn.count() > 0:
+                    # Click the first visible one
+                    try:
+                        await btn.first.click(timeout=1200)
+                        await page.wait_for_timeout(400)
+                        return
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        await page.wait_for_timeout(500)
+
+
+async def search_match_on_oddsportal(page: Page, match: str) -> None:
+    """
+    Uses OddsPortal top search (magnifier) by opening a search URL.
+    This avoids needing brittle UI selectors for the search box.
+    """
+    q = match.strip()
+    # OddsPortal has /search/ which redirects to Next Match Search results.
+    url = f"{ODDSPORTAL_BASE}/search/?q={q.replace(' ', '%20')}"
+    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    await accept_privacy_if_present(page)
+    await page.wait_for_timeout(600)
+
+
+async def extract_first_match_link(page: Page, wanted_match: str) -> Optional[str]:
+    """
+    On the search results page, try to find a reasonable football match link.
+    We prefer links that contain both teams words, but keep it simple/stable.
+    """
+    wanted_norm = normalize_text(wanted_match)
+
+    # Pull all anchors; filter likely event links
+    anchors = page.locator("a[href]")
+    n = await anchors.count()
+    if n == 0:
+        return None
+
+    best_href = None
+    best_score = 0
+
+    for i in range(min(n, 400)):  # cap to avoid huge loops
+        a = anchors.nth(i)
+        try:
+            href = await a.get_attribute("href")
+            if not href:
+                continue
+
+            # Typical match URLs contain /football/... and have long-ish paths
+            if "/football/" not in href:
+                continue
+            if "/results/" in href:
+                continue
+
             text = (await a.inner_text()) or ""
-            t = normalize_team_name(text)
-            if home and away and (home in t) and (away in t):
-                href = await a.get_attribute("href")
-                if href and "/match/" in href:
-                    best = href
-                    break
+            text_norm = normalize_text(text)
+
+            # Score by token overlap with wanted match
+            score = 0
+            for token in wanted_norm.split():
+                if token and token in text_norm:
+                    score += 1
+
+            if score > best_score:
+                best_score = score
+                best_href = href
+
+            # Early exit if it's very likely the right one
+            if best_score >= 4:
+                break
         except Exception:
             continue
 
-    if not best:
+    if not best_href:
         return None
 
-    if best.startswith("/"):
-        return ODDSPORTAL_BASE + best
-    if best.startswith("http"):
-        return best
-    return ODDSPORTAL_BASE + "/" + best.lstrip("/")
+    if best_href.startswith("http"):
+        return best_href
+    return f"{ODDSPORTAL_BASE}{best_href}"
 
 
-async def main():
+async def run() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-    over15_rows = read_input_csv(INPUT_OVER15)
-    over05_rows = read_input_csv(INPUT_OVER05_1H)
+    over15 = read_input_csv(IN_OVER15, "over15")
+    over05 = read_input_csv(IN_OVER05_1H, "over05_1h")
+    all_rows = over15 + over05
 
-    print(f"[input] Over1.5 rows: {len(over15_rows)}")
-    print(f"[input] Over0.5 1H rows: {len(over05_rows)}")
+    if not all_rows:
+        print("[error] No input rows found. Check input/Over15.csv and input/Over05_1h.csv")
+        return 2
+
+    print(f"[info] rows: over15={len(over15)} over05_1h={len(over05)} total={len(all_rows)}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
-        context = await browser.new_context()
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            viewport={"width": 1400, "height": 900},
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        )
         page = await context.new_page()
 
-        # 1) Resolver links
-        link_map: dict[str, str] = {}
+        out_rows = []
+        for r in all_rows:
+            try:
+                await search_match_on_oddsportal(page, r.match)
+                link = await extract_first_match_link(page, r.match)
 
-        async def resolve(rows: list[Row], label: str):
-            for r in rows:
-                key = f"{label}:{r.idx}"
+                if not link:
+                    # Debug screenshot
+                    shot = DEBUG_DIR / f"{_now_utc_str()}_search-miss-{r.bucket}-{r.idx}.png"
+                    try:
+                        await page.screenshot(path=str(shot), full_page=True)
+                    except Exception:
+                        pass
+                    print(f"[link-miss] {r.bucket} #{r.idx} {r.match} ({r.league})")
+                else:
+                    print(f"[ok] {r.bucket} #{r.idx} -> {link}")
+
+                out_rows.append({
+                    "bucket": r.bucket,
+                    "idx": r.idx,
+                    "match": r.match,
+                    "league": r.league,
+                    "oddsportal_link": link or "",
+                })
+
+            except Exception as e:
+                shot = DEBUG_DIR / f"{_now_utc_str()}_error-{r.bucket}-{r.idx}.png"
                 try:
-                    link = await find_match_link_for_row(page, r)
-                    if not link:
-                        print(f"[link-miss] {label} #{r.idx} {r.match} ({r.league})")
-                        await dump_debug(page, f"search_miss_{label}_{r.idx}_{r.match}")
-                        continue
-                    link_map[key] = link
-                    print(f"[link-ok] {label} #{r.idx} -> {link}")
-                except Exception as e:
-                    print(f"[link-error] {label} #{r.idx} {r.match}: {e}")
-                    await dump_debug(page, f"search_err_{label}_{r.idx}_{r.match}")
+                    await page.screenshot(path=str(shot), full_page=True)
+                except Exception:
+                    pass
+                print(f"[error] {r.bucket} #{r.idx} {r.match}: {e}")
+                out_rows.append({
+                    "bucket": r.bucket,
+                    "idx": r.idx,
+                    "match": r.match,
+                    "league": r.league,
+                    "oddsportal_link": "",
+                })
 
-        await resolve(over15_rows, "over15")
-        await resolve(over05_rows, "over05_1h")
-
+        await context.close()
         await browser.close()
 
-    # Guardamos el mapping para que veas qué encontró y qué no
-    mapping_path = OUT_DIR / "match_links.csv"
-    with mapping_path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["bucket", "idx", "match", "league", "oddsportal_link"])
-        for r in over15_rows:
-            k = f"over15:{r.idx}"
-            w.writerow(["over15", r.idx, r.match, r.league, link_map.get(k, "")])
-        for r in over05_rows:
-            k = f"over05_1h:{r.idx}"
-            w.writerow(["over05_1h", r.idx, r.match, r.league, link_map.get(k, "")])
+    # Write output CSV
+    with OUT_MATCH_LINKS.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["bucket", "idx", "match", "league", "oddsportal_link"])
+        w.writeheader()
+        for r in out_rows:
+            w.writerow(r)
 
-    print(f"[ok] wrote: {mapping_path}")
+    print(f"[done] wrote: {OUT_MATCH_LINKS}")
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(run()))
