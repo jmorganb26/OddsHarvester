@@ -1,14 +1,30 @@
-name: Smoke test inputs
+name: Scrape selected odds (Over1.5 + Over0.5 1H)
 
 on:
   workflow_dispatch:
 
 jobs:
-  smoke:
+  scrape:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv
+          uv sync
+
+      - name: Install Playwright
+        run: |
+          uv run playwright install --with-deps chromium
 
       - name: Print input counts
         run: |
@@ -18,3 +34,25 @@ jobs:
           head -n 5 input/Over15.csv || true
           echo "=== head Over05_1h.csv ==="
           head -n 5 input/Over05_1h.csv || true
+
+      - name: Run selected scraper
+        run: |
+          mkdir -p out
+          uv run python scripts/run_selected_odds.py
+
+      - name: List outputs
+        run: |
+          echo "=== listing out folder ==="
+          ls -la out || true
+          echo "=== head out/over15_odds.csv ==="
+          head -n 10 out/over15_odds.csv || true
+          echo "=== head out/over05_1h_odds.csv ==="
+          head -n 10 out/over05_1h_odds.csv || true
+
+      - name: Upload CSVs
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected_odds_csv
+          path: |
+            out/over15_odds.csv
+            out/over05_1h_odds.csv
