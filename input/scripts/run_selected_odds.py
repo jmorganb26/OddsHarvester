@@ -22,28 +22,6 @@ jobs:
           pip install uv
           uv sync
 
-      - name: Install Playwright
+      - name: Smoke test - load selected universes
         run: |
-          uv run playwright install --with-deps chromium
-
-      - name: Run scraper
-        run: |
-          mkdir -p out
-          DATE=$(date -u -d "tomorrow" +"%Y%m%d")
-          echo "Scraping date (UTC): $DATE"
-          uv run oddsharvester upcoming \
-          -s football \
-          -m over_under_1_5 \
-          --target-bookmaker bet365.us \
-          --format csv \
-          -o out/odds.csv \
-          --concurrency 10 \
-          --preview-only \
-          --headless \
-          -d $DATE
-
-      - name: Upload CSV
-        uses: actions/upload-artifact@v4
-        with:
-          name: odds_csv
-          path: out/odds.csv
+          python scripts/run_selected_odds.py
