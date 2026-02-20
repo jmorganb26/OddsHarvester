@@ -1,5 +1,4 @@
-Filtro:,Over 1.5,
-,,
+idx,match,league
 1,Tigres UANL vs Pachuca CF,México Liga MX
 2,Puebla FC vs Club América,México Liga MX
 3,Athletic Bilbao vs Elche,España La Liga
@@ -99,3 +98,4 @@ Filtro:,Over 1.5,
 97,Adelaide United vs Perth Glory,Australia A-League
 98,Wellington Phoenix vs Auckland,Australia A-League
 99,Sydney FC vs Brisbane Roar,Australia A-League
+
