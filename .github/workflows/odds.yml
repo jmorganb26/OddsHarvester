@@ -36,23 +36,16 @@ jobs:
           head -n 5 input/Over05_1h.csv || true
 
       - name: Run selected scraper
+        env:
+          OH_HEADLESS: "1"
+          OH_DEBUG_DUMP: "1"
         run: |
-          mkdir -p out
+          mkdir -p out/debug
           uv run python scripts/run_selected_odds.py
 
-      - name: List outputs
-        run: |
-          echo "=== listing out folder ==="
-          ls -la out || true
-          echo "=== head out/over15_odds.csv ==="
-          head -n 10 out/over15_odds.csv || true
-          echo "=== head out/over05_1h_odds.csv ==="
-          head -n 10 out/over05_1h_odds.csv || true
-
-      - name: Upload CSVs
+      - name: Upload outputs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: selected_odds_csv
-          path: |
-            out/over15_odds.csv
-            out/over05_1h_odds.csv
+          name: out
+          path: out
