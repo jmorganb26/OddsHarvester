@@ -1,0 +1,49 @@
+name: Scrape odds tomorrow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv
+          uv sync
+
+      - name: Install Playwright
+        run: |
+          uv run playwright install --with-deps chromium
+
+      - name: Run scraper
+        run: |
+          mkdir -p out
+          DATE=$(date -u -d "tomorrow" +"%Y%m%d")
+          echo "Scraping date (UTC): $DATE"
+          uv run oddsharvester upcoming \
+          -s football \
+          -m over_under_1_5 \
+          --target-bookmaker bet365.us \
+          --format csv \
+          -o out/odds.csv \
+          --concurrency 10 \
+          --preview-only \
+          --headless \
+          -d $DATE
+
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_csv
+          path: out/odds.csv
