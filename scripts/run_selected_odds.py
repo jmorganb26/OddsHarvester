@@ -1,151 +1,195 @@
-#!/usr/bin/env python3
-"""
-Run selected odds scrape (Over 1.5 FT + Over 0.5 1H) based on input CSVs.
-
-NOTA:
-- En esta iteración dejamos el scraping REAL como “diagnóstico” para confirmar
-  la estructura exacta del JSON/keys que devuelve oddsharvester, porque cambia
-  según market/period/bookie.
-- El objetivo de este archivo es: 1) existir en la ruta correcta, 2) leer inputs,
-  3) ejecutar un scrape mínimo y 4) guardar un JSON crudo para que ya sin adivinar
-  hagamos el mapeo final de momios.
-"""
-
-from __future__ import annotations
-
+import asyncio
 import csv
-import json
 import os
-from datetime import datetime, timedelta, timezone
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Optional
 
-from oddsharvester.core.scraper_app import run_scraper
-from oddsharvester.utils.command_enum import CommandEnum
+from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
+ODDSPORTAL_BASE = "https://www.oddsportal.com"
+SPORT = "football"
 
-ROOT = Path(__file__).resolve().parents[1]
-INPUT_DIR = ROOT / "input"
-OUT_DIR = ROOT / "out"
+INPUT_OVER15 = Path("input/Over15.csv")
+INPUT_OVER05_1H = Path("input/Over05_1h.csv")
 
-OVER15_CSV = INPUT_DIR / "Over15.csv"
-OVER05_1H_CSV = INPUT_DIR / "Over05_1h.csv"
-
-# bookies (por ahora 1) -> en el siguiente paso lo hacemos 2 y promedio
-TARGET_BOOKMAKER = os.environ.get("TARGET_BOOKMAKER", "bet365.us")
+OUT_DIR = Path("out")
+DEBUG_DIR = OUT_DIR / "debug"
 
 
-def _tomorrow_yyyymmdd_utc() -> str:
-    now = datetime.now(timezone.utc)
-    tomorrow = now + timedelta(days=1)
-    return tomorrow.strftime("%Y%m%d")
+def env_true(name: str) -> bool:
+    v = os.getenv(name, "").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
 
 
-def _read_input_csv(path: Path) -> list[dict[str, str]]:
-    """
-    Lee tu CSV que trae líneas como:
-    Filtro:,Over 1.5,
-    ,,
-    1,Tigres UANL vs Pachuca CF,México Liga MX
-    ...
-    Retorna lista de {idx, match, league}.
-    """
-    rows: list[dict[str, str]] = []
-    if not path.exists():
-        raise FileNotFoundError(f"No existe: {path}")
+HEADLESS = env_true("OH_HEADLESS")
+DEBUG_DUMP = env_true("OH_DEBUG_DUMP")
 
+
+@dataclass
+class Row:
+    idx: str
+    match: str
+    league: str
+
+
+def slug(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    return s.strip("-")[:80] or "item"
+
+
+def read_input_csv(path: Path) -> list[Row]:
+    rows: list[Row] = []
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
         for r in reader:
             if not r:
                 continue
-            # Queremos filas tipo: [num, "Equipo A vs Equipo B", "Liga..."]
+            # Tus CSV traen encabezados tipo: "Filtro:,Over 1.5," y luego ",,"
+            if len(r) >= 1 and (r[0].startswith("Filtro:") or r[0].strip() == ""):
+                continue
+            # Formato esperado: idx, match, league
             if len(r) < 3:
                 continue
-            idx = (r[0] or "").strip()
-            match = (r[1] or "").strip()
-            league = (r[2] or "").strip()
-
+            idx, match, league = r[0].strip(), r[1].strip(), r[2].strip()
             if not idx.isdigit():
                 continue
-            if " vs " not in match:
+            if not match or " vs " not in match:
                 continue
-
-            rows.append({"idx": idx, "match": match, "league": league})
-
+            rows.append(Row(idx=idx, match=match, league=league))
     return rows
 
 
-async def _scrape_raw_over15(date_yyyymmdd: str) -> dict[str, Any]:
+def normalize_team_name(s: str) -> str:
+    s = s.lower().strip()
+    s = s.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u").replace("ü", "u").replace("ñ", "n")
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def split_match(match: str) -> tuple[str, str]:
+    home, away = match.split(" vs ", 1)
+    return normalize_team_name(home), normalize_team_name(away)
+
+
+async def dump_debug(page, tag: str):
+    if not DEBUG_DUMP:
+        return
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    base = DEBUG_DIR / f"{ts}_{slug(tag)}"
+    try:
+        await page.screenshot(path=str(base) + ".png", full_page=True)
+    except Exception:
+        pass
+    try:
+        html = await page.content()
+        (Path(str(base) + ".html")).write_text(html, encoding="utf-8")
+    except Exception:
+        pass
+
+
+async def find_match_link_for_row(page, row: Row) -> Optional[str]:
     """
-    Scrape “crudo” para Over 1.5 FT del día (por fecha).
-    En el siguiente paso: filtramos por tus inputs y extraemos momios por bookie.
+    Estrategia:
+    1) Buscar por el match completo (texto) en OddsPortal (search).
+    2) Abrir resultados y escoger el que mejor matchee por home/away.
     """
-    # Importante: headless True en GH Actions
-    result = await run_scraper(
-        command=CommandEnum.UPCOMING_MATCHES,
-        sport="football",
-        date=date_yyyymmdd,
-        leagues=None,
-        markets=["over_under_1_5"],
-        target_bookmaker=TARGET_BOOKMAKER,
-        headless=True,
-        preview_submarkets_only=False,
-        period=None,
-    )
+    home, away = split_match(row.match)
 
-    if result is None:
-        return {"ok": False, "error": "run_scraper devolvió None"}
+    query = row.match
+    search_url = f"{ODDSPORTAL_BASE}/search/?q={query.replace(' ', '+')}"
+    await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+    await page.wait_for_timeout(800)
 
-    # ScrapeResult es dataclass-like con .success/.failed/.stats
-    payload: dict[str, Any] = {
-        "ok": True,
-        "target_bookmaker": TARGET_BOOKMAKER,
-        "date": date_yyyymmdd,
-        "stats": getattr(result, "stats", None).__dict__ if getattr(result, "stats", None) else None,
-        "success_count": len(getattr(result, "success", []) or []),
-        "failed_count": len(getattr(result, "failed", []) or []),
-        "success": getattr(result, "success", []),
-        "failed": [f.__dict__ for f in getattr(result, "failed", [])] if getattr(result, "failed", None) else [],
-    }
-    return payload
+    # Si OddsPortal cambia el DOM, esto igual puede fallar: por eso debug dump.
+    try:
+        items = page.locator("a").filter(has_text=" - ").all()
+    except Exception:
+        items = []
+
+    # Fallback más robusto: buscar anchors que contengan ambos equipos (normalizados)
+    anchors = await page.query_selector_all("a[href]")
+    best = None
+
+    for a in anchors:
+        try:
+            text = (await a.inner_text()) or ""
+            t = normalize_team_name(text)
+            if home and away and (home in t) and (away in t):
+                href = await a.get_attribute("href")
+                if href and "/match/" in href:
+                    best = href
+                    break
+        except Exception:
+            continue
+
+    if not best:
+        return None
+
+    if best.startswith("/"):
+        return ODDSPORTAL_BASE + best
+    if best.startswith("http"):
+        return best
+    return ODDSPORTAL_BASE + "/" + best.lstrip("/")
 
 
-def main() -> None:
+async def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-    over15 = _read_input_csv(OVER15_CSV)
-    over05 = _read_input_csv(OVER05_1H_CSV)
+    over15_rows = read_input_csv(INPUT_OVER15)
+    over05_rows = read_input_csv(INPUT_OVER05_1H)
 
-    print(f"[OK] Inputs leídos:")
-    print(f" - Over15: {len(over15)} filas")
-    print(f" - Over0.5 1H: {len(over05)} filas")
+    print(f"[input] Over1.5 rows: {len(over15_rows)}")
+    print(f"[input] Over0.5 1H rows: {len(over05_rows)}")
 
-    date = _tomorrow_yyyymmdd_utc()
-    print(f"[OK] Fecha objetivo (UTC tomorrow): {date}")
-    print(f"[OK] Target bookmaker: {TARGET_BOOKMAKER}")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=HEADLESS)
+        context = await browser.new_context()
+        page = await context.new_page()
 
-    # Scrape crudo (para diagnóstico de estructura)
-    import asyncio  # noqa
+        # 1) Resolver links
+        link_map: dict[str, str] = {}
 
-    raw = asyncio.run(_scrape_raw_over15(date))
+        async def resolve(rows: list[Row], label: str):
+            for r in rows:
+                key = f"{label}:{r.idx}"
+                try:
+                    link = await find_match_link_for_row(page, r)
+                    if not link:
+                        print(f"[link-miss] {label} #{r.idx} {r.match} ({r.league})")
+                        await dump_debug(page, f"search_miss_{label}_{r.idx}_{r.match}")
+                        continue
+                    link_map[key] = link
+                    print(f"[link-ok] {label} #{r.idx} -> {link}")
+                except Exception as e:
+                    print(f"[link-error] {label} #{r.idx} {r.match}: {e}")
+                    await dump_debug(page, f"search_err_{label}_{r.idx}_{r.match}")
 
-    raw_path = OUT_DIR / "raw_over15.json"
-    raw_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[OK] Guardado: {raw_path}")
+        await resolve(over15_rows, "over15")
+        await resolve(over05_rows, "over05_1h")
 
-    # También guardo “muestra” de keys para que veas qué trae cada match
-    sample_path = OUT_DIR / "raw_over15_sample_keys.txt"
-    lines: list[str] = []
-    success = raw.get("success") or []
-    for i, item in enumerate(success[:25], 1):
-        if isinstance(item, dict):
-            lines.append(f"#{i} keys: {sorted(list(item.keys()))}")
-    sample_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"[OK] Guardado: {sample_path}")
+        await browser.close()
 
-    print("[DONE] Paso diagnóstico completo.")
+    # Guardamos el mapping para que veas qué encontró y qué no
+    mapping_path = OUT_DIR / "match_links.csv"
+    with mapping_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["bucket", "idx", "match", "league", "oddsportal_link"])
+        for r in over15_rows:
+            k = f"over15:{r.idx}"
+            w.writerow(["over15", r.idx, r.match, r.league, link_map.get(k, "")])
+        for r in over05_rows:
+            k = f"over05_1h:{r.idx}"
+            w.writerow(["over05_1h", r.idx, r.match, r.league, link_map.get(k, "")])
+
+    print(f"[ok] wrote: {mapping_path}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
