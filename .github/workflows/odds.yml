@@ -1,4 +1,4 @@
-name: Scrape odds tomorrow
+name: Scrape odds tomorrow (OU1.5 FT + O0.5 1H, avg 2 books)
 
 on:
   workflow_dispatch:
@@ -19,30 +19,185 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install uv
+          pip install uv pandas
           uv sync
 
       - name: Install Playwright
         run: |
           uv run playwright install --with-deps chromium
 
-      - name: Run scraper
+      - name: Run scrapers (2 markets x 2 books)
         run: |
           mkdir -p out
           DATE=$(date -u -d "tomorrow" +"%Y%m%d")
           echo "Scraping date (UTC): $DATE"
-          uv run oddsharvester upcoming \
-          -s football \
-          -m 1x2,btts,over_under_1_5,asian_handicap_-1,asian_handicap_-1_5,asian_handicap_-2,asian_handicap_-2_5,asian_handicap_-3 \
-          --target-bookmaker bet365.us \
-          --format csv \
-          -o out/odds.csv \
-          --concurrency 10 \
-          --preview-only \
-          -d $DATE
 
-      - name: Upload CSV
+          # ---- Settings ----
+          CONCURRENCY=6
+          # Keep preview-only for speed; if you see missing odds often, switch to --full-scrape
+          SCRAPE_MODE="--preview-only"
+
+          # ---- Bookmakers ----
+          B1="bet365.us"
+          B2="Pinnacle"
+
+          echo "Bookmakers: $B1 + $B2"
+
+          # 1) Over/Under 1.5 FULL TIME (we only need the OVER price)
+          uv run oddsharvester upcoming \
+            -s football \
+            -m over_under_1_5 \
+            --period full_time \
+            --target-bookmaker "$B1" \
+            --format csv \
+            -o "out/ou15_ft_${B1}.csv" \
+            --concurrency $CONCURRENCY \
+            $SCRAPE_MODE \
+            -d $DATE
+
+          uv run oddsharvester upcoming \
+            -s football \
+            -m over_under_1_5 \
+            --period full_time \
+            --target-bookmaker "$B2" \
+            --format csv \
+            -o "out/ou15_ft_${B2}.csv" \
+            --concurrency $CONCURRENCY \
+            $SCRAPE_MODE \
+            -d $DATE
+
+          # 2) Over/Under 0.5 FIRST HALF (we only need the OVER price)
+          uv run oddsharvester upcoming \
+            -s football \
+            -m over_under_0_5 \
+            --period 1st_half \
+            --target-bookmaker "$B1" \
+            --format csv \
+            -o "out/ou05_1h_${B1}.csv" \
+            --concurrency $CONCURRENCY \
+            $SCRAPE_MODE \
+            -d $DATE
+
+          uv run oddsharvester upcoming \
+            -s football \
+            -m over_under_0_5 \
+            --period 1st_half \
+            --target-bookmaker "$B2" \
+            --format csv \
+            -o "out/ou05_1h_${B2}.csv" \
+            --concurrency $CONCURRENCY \
+            $SCRAPE_MODE \
+            -d $DATE
+
+      - name: Merge + average (bet365.us + Pinnacle)
+        run: |
+          python - <<'PY'
+          import os, ast
+          import pandas as pd
+
+          B1 = "bet365.us"
+          B2 = "Pinnacle"
+
+          def load_csv(path):
+            if not os.path.exists(path):
+              raise FileNotFoundError(path)
+            df = pd.read_csv(path)
+            return df
+
+          def extract_over_price(cell):
+            """
+            cell is usually like:
+              [{'odds_over':'1.30','odds_under':'3.50','bookmaker_name':'bet365.us','period':'FullTime'}]
+            or [].
+            We only take odds_over from the first item if present.
+            """
+            if pd.isna(cell):
+              return None
+            s = str(cell).strip()
+            if s == "[]" or s == "" or s.lower() == "nan":
+              return None
+            try:
+              data = ast.literal_eval(s)
+              if not isinstance(data, list) or len(data) == 0:
+                return None
+              item = data[0]
+              if not isinstance(item, dict):
+                return None
+              v = item.get("odds_over")
+              if v is None:
+                return None
+              return float(v)
+            except Exception:
+              return None
+
+          # Files
+          f_ou15_b1 = f"out/ou15_ft_{B1}.csv"
+          f_ou15_b2 = f"out/ou15_ft_{B2}.csv"
+          f_ou05_b1 = f"out/ou05_1h_{B1}.csv"
+          f_ou05_b2 = f"out/ou05_1h_{B2}.csv"
+
+          d15_1 = load_csv(f_ou15_b1)
+          d15_2 = load_csv(f_ou15_b2)
+          d05_1 = load_csv(f_ou05_b1)
+          d05_2 = load_csv(f_ou05_b2)
+
+          # Columns names depend on your exporter; these are from your sample schema:
+          col_ou15 = "over_under_1_5_market"
+          col_ou05 = "over_under_0_5_market"
+
+          key_cols = ["match_link","match_date","home_team","away_team","league_name"]
+
+          # Reduce and extract prices
+          def reduce(df, col, outcol):
+            base = df.copy()
+            # some rows may lack league_name; keep anyway
+            for c in key_cols:
+              if c not in base.columns:
+                base[c] = None
+            base[outcol] = base[col].apply(extract_over_price) if col in base.columns else None
+            return base[key_cols + [outcol]]
+
+          r15_1 = reduce(d15_1, col_ou15, "ou15_over_"+B1)
+          r15_2 = reduce(d15_2, col_ou15, "ou15_over_"+B2)
+          r05_1 = reduce(d05_1, col_ou05, "ou05_1h_over_"+B1)
+          r05_2 = reduce(d05_2, col_ou05, "ou05_1h_over_"+B2)
+
+          # Merge by match_link (most stable key)
+          def m2(a,b):
+            return a.merge(b, on=key_cols, how="outer")
+
+          merged = m2(m2(r15_1, r15_2), m2(r05_1, r05_2))
+
+          # Averages (only where at least 1 value exists)
+          def avg2(x,y):
+            if pd.isna(x) and pd.isna(y): return None
+            if pd.isna(x): return float(y)
+            if pd.isna(y): return float(x)
+            return float((x+y)/2)
+
+          merged["ou15_over_avg"] = merged.apply(lambda r: avg2(r.get("ou15_over_"+B1), r.get("ou15_over_"+B2)), axis=1)
+          merged["ou05_1h_over_avg"] = merged.apply(lambda r: avg2(r.get("ou05_1h_over_"+B1), r.get("ou05_1h_over_"+B2)), axis=1)
+
+          # Output (focus fields + keep per-book for debugging)
+          out_cols = key_cols + [
+            "ou15_over_"+B1, "ou15_over_"+B2, "ou15_over_avg",
+            "ou05_1h_over_"+B1, "ou05_1h_over_"+B2, "ou05_1h_over_avg",
+          ]
+          merged = merged[out_cols].sort_values(["match_date","league_name","home_team","away_team"], na_position="last")
+
+          os.makedirs("out", exist_ok=True)
+          merged.to_csv("out/odds_focus.csv", index=False)
+          print("OK: wrote out/odds_focus.csv rows=", len(merged))
+          PY
+
+      - name: Upload focused CSV
         uses: actions/upload-artifact@v4
         with:
-          name: odds_csv
-          path: out/odds.csv
+          name: odds_focus_csv
+          path: out/odds_focus.csv
+
+      - name: Upload raw CSVs (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_raw_csvs
+          path: out/*.csv
